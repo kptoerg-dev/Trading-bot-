@@ -3,6 +3,7 @@ import ccxt
 import pandas as pd
 import numpy as np
 import logging
+import requests
 from datetime import datetime
 
 # ==========================================
@@ -15,38 +16,51 @@ TIMEFRAME = '15m'
 DRY_RUN = True          # True = Nur simulieren, False = Echte Orders platzieren
 MAX_POSITION_EUR = 5.0  # Max. Einsatz pro Trade
 
+# ==========================================
+# TELEGRAM KONFIGURATION
+# ==========================================
+TELEGRAM_TOKEN = '8970011732:AAFGRUAOE3upiNiBzJBI6j71dbXbuWBo5hw'
+TELEGRAM_CHAT_ID = '8952651770'
+
+def send_telegram_message(msg: str):
+    """Sendet eine Nachricht an deinen Telegram-Chat."""
+    if not TELEGRAM_TOKEN or TELEGRAM_TOKEN == 'DEIN_API_TOKEN_HIER':
+        return  # Überspringen, falls nicht konfiguriert
+    
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}
+    try:
+        requests.post(url, data=data)
+    except Exception as e:
+        logging.error(f"Konnte Telegram-Nachricht nicht senden: {e}")
+
 # Strategie-Parameter
 EMA_TREND_PERIOD = 200
 RSI_PERIOD = 14
 RSI_OVERSOLD = 35
 ATR_PERIOD = 14
-ATR_SL_MULTIPLIER = 1.5   # Stop-Loss = 1.5x ATR unter Einstieg
-ATR_TP_ACTIVATION = 2.5  # Trailing TP aktiviert sich ab 2.5x ATR
-TRAILING_CALLBACK = 0.015 # 1.5% Rücksetzer vom Hoch löst TP aus
+ATR_SL_MULTIPLIER = 1.5   
+ATR_TP_ACTIVATION = 2.5  
+TRAILING_CALLBACK = 0.015 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] %(message)s')
 
 # ==========================================
-# INDIKATOR-BERECHNUNGEN (Reines Pandas)
+# INDIKATOR-BERECHNUNGEN
 # ==========================================
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    # 1. EMA 200 (Trend-Filter)
     df['ema_200'] = df['close'].ewm(span=EMA_TREND_PERIOD, adjust=False).mean()
-
-    # 2. RSI 14 (Momentum)
     delta = df['close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=RSI_PERIOD).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=RSI_PERIOD).mean()
     rs = gain / (loss + 1e-9)
     df['rsi'] = 100 - (100 / (1 + rs))
 
-    # 3. ATR 14 (Volatilität für dynamische Stopps)
     high_low = df['high'] - df['low']
     high_close = np.abs(df['high'] - df['close'].shift())
     low_close = np.abs(df['low'] - df['close'].shift())
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['atr'] = tr.rolling(window=ATR_PERIOD).mean()
-
     return df
 
 # ==========================================
@@ -55,11 +69,7 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
 class RobustTradingBot:
     def __init__(self):
         exchange_class = getattr(ccxt, EXCHANGE_ID)
-        self.exchange = exchange_class({
-            'enableRateLimit': True,
-            # 'apiKey': 'DEIN_KEY',
-            # 'secret': 'DEIN_SECRET',
-        })
+        self.exchange = exchange_class({'enableRateLimit': True})
         self.in_position = False
         self.entry_price = 0.0
         self.stop_loss = 0.0
@@ -73,7 +83,6 @@ class RobustTradingBot:
         return calculate_indicators(df)
 
     def evaluate_entry(self, row: pd.Series):
-        # Regel: Kurs > EMA 200 (Aufwärtstrend) UND RSI < 35 (Kurzfristiger Dip)
         if row['close'] > row['ema_200'] and row['rsi'] < RSI_OVERSOLD:
             current_price = row['close']
             current_atr = row['atr']
@@ -84,42 +93,48 @@ class RobustTradingBot:
             self.highest_price = current_price
             self.trailing_active = False
 
-            logging.info(f"🚀 KAUF-SIGNAL bei {current_price:.2f} USDT | SL: {self.stop_loss:.2f} (ATR: {current_atr:.2f})")
+            msg = f"🚀 <b>KAUF-SIGNAL ({SYMBOL})</b>\nEinstieg: {current_price:.2f} USDT\nStop-Loss: {self.stop_loss:.2f} USDT"
+            logging.info(msg)
+            send_telegram_message(msg)
 
     def evaluate_exit(self, current_price: pd.Series, current_atr: float):
-        # 1. Höchststand tracken für Trailing TP
         if current_price > self.highest_price:
             self.highest_price = current_price
 
-        # 2. Break-Even-Schutz: Wenn Kurs 1.5x ATR über Einstieg -> SL mindestens auf Einstiegskurs
+        # Break-Even
         if current_price >= (self.entry_price + (current_atr * 1.5)):
             if self.stop_loss < self.entry_price:
                 self.stop_loss = self.entry_price
-                logging.info(f"🛡️ BREAK-EVEN AKTIVIERT: Stop-Loss auf Einstieg ({self.entry_price:.2f}) angehoben.")
+                msg = f"🛡️ <b>BREAK-EVEN AKTIVIERT</b>\nStop-Loss auf Einstiegskurs ({self.entry_price:.2f}) angehoben."
+                logging.info(msg)
+                send_telegram_message(msg)
 
-        # 3. Trailing Take-Profit Prüfung
+        # Trailing TP Aktivierung
         if not self.trailing_active and current_price >= (self.entry_price + (current_atr * ATR_TP_ACTIVATION)):
             self.trailing_active = True
-            logging.info("🎯 TRAILING TAKE-PROFIT SCHARFGESCHALTET.")
+            send_telegram_message("🎯 <b>TRAILING TAKE-PROFIT SCHARFGESCHALTET</b>")
 
-        # 4. Ausstiegs-Bedingungen prüfen
-        # A) Harter Stop-Loss
+        # Stop-Loss greift
         if current_price <= self.stop_loss:
             pnl_pct = ((current_price - self.entry_price) / self.entry_price) * 100
-            logging.info(f"🛑 STOP-LOSS AUSGELÖST bei {current_price:.2f} USDT | PnL: {pnl_pct:.2f}%")
+            msg = f"🛑 <b>STOP-LOSS AUSGELÖST</b>\nVerkauf bei: {current_price:.2f} USDT\nPnL: {pnl_pct:.2f}%"
+            logging.info(msg)
+            send_telegram_message(msg)
             self.in_position = False
 
-        # B) Trailing Take-Profit Rücksetzer
+        # Trailing TP greift
         elif self.trailing_active and current_price <= (self.highest_price * (1 - TRAILING_CALLBACK)):
             pnl_pct = ((current_price - self.entry_price) / self.entry_price) * 100
-            logging.info(f"💰 TAKE-PROFIT AUSGELÖST bei {current_price:.2f} USDT | PnL: +{pnl_pct:.2f}%")
+            msg = f"💰 <b>TAKE-PROFIT AUSGELÖST</b>\nVerkauf bei: {current_price:.2f} USDT\nPnL: +{pnl_pct:.2f}%"
+            logging.info(msg)
+            send_telegram_message(msg)
             self.in_position = False
 
     def run_cycle(self):
         try:
             df = self.fetch_ohlcv()
-            last_closed = df.iloc[-2]  # Abgeschlossene Kerze für Signale
-            current_tick = df.iloc[-1]['close'] # Aktueller Live-Tick
+            last_closed = df.iloc[-2]  
+            current_tick = df.iloc[-1]['close'] 
 
             if not self.in_position:
                 self.evaluate_entry(last_closed)
@@ -127,13 +142,16 @@ class RobustTradingBot:
                 self.evaluate_exit(current_tick, last_closed['atr'])
 
         except Exception as e:
-            logging.error(f"Fehler im Abfragezyklus: {e}")
+            logging.error(f"Fehler im Zyklus: {e}")
 
     def start(self):
-        logging.info(f"Bot initialisiert ({'DRY RUN' if DRY_RUN else 'LIVE'}). Warte auf Marktsignale...")
+        start_msg = f"✅ Bot gestartet auf Server.\nModus: {'DRY RUN' if DRY_RUN else 'LIVE'}\nWarte auf Signale..."
+        logging.info(start_msg)
+        send_telegram_message(start_msg)
+        
         while True:
             self.run_cycle()
-            time.sleep(15)  # 15 Sekunden Polling-Intervall
+            time.sleep(15)  
 
 if __name__ == '__main__':
     bot = RobustTradingBot()
