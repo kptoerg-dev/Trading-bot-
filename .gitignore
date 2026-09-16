@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# ==========================================
+# MEINE EIGENEN REGELN (SECRETS - SEHR WICHTIG!)
+# ==========================================
+config.py
+*.json
+.env
